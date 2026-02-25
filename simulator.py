@@ -2,12 +2,13 @@ import os
 import time
 import math
 import random
+import argparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict
+from typing import Dict, List
 
 
-# ---------------- Simulator (same model as before, compact) ----------------
+# ---------------- Simulator ----------------
 
 @dataclass
 class SimConfig:
@@ -28,26 +29,27 @@ class SimConfig:
     overhead_min: float = 0.25
     overhead_max: float = 0.55
 
-    # Pressure (bar) — adjust if your plant uses MPa/psi
+    # Pressure (bar)
     max_inj_pressure_min: float = 900.0
     max_inj_pressure_max: float = 1700.0
     cavity_pressure_fraction_mean: float = 0.62
     cavity_pressure_fraction_sd: float = 0.06
 
     # OEE (per line) — values in [0, 1], Gaussian then clipped
-    oee_lines = ("TOK", "TOF", "TOE")
-    oee_availability_mean: float = 0.60
+    # oee_availability_mean: float = 0.60
     oee_productivity_mean: float = 0.80
     oee_quality_mean: float = 0.98
 
-    # Minimal SDs (small, but not so small that quality becomes "always clipped")
-    oee_availability_sd: float = 0.02
+    # oee_availability_sd: float = 0.02
     oee_productivity_sd: float = 0.015
     oee_quality_sd: float = 0.006
 
 
-
 class IMMProxySimulator:
+    """
+    One simulator instance = one line.
+    """
+
     def __init__(self, cfg: SimConfig):
         self.cfg = cfg
         self.rng = random.Random(cfg.seed)
@@ -59,6 +61,8 @@ class IMMProxySimulator:
         self.global_temp_drift = 0.0
         self.global_press_drift = 0.0
 
+        self.last_downtime_end = 0  # track when the last downtime ended
+
     def _clamp(self, x: float, lo: float, hi: float) -> float:
         return max(lo, min(hi, x))
 
@@ -67,21 +71,39 @@ class IMMProxySimulator:
         u2 = self.rng.random()
         z = math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2)
         return mu + sigma * z
-    
+
     def _trunc_norm_01(self, mean: float, sd: float) -> float:
-        # Gaussian sample then clamp to [0, 1]
         return self._clamp(self._randn(mean, sd), 0.0, 1.0)
 
-
-    def next_cycle(self, anomaly_prob: float = 0.01) -> Dict[str, float]:
+    def next_cycle(self, anomaly_prob: float = 0.01, downtime_prob: float = 0.02) -> Dict[str, float]:
         cfg = self.cfg
 
         # Slow drift
         self.global_temp_drift += self._randn(0.0, 0.003)
         self.global_press_drift += self._randn(0.0, 0.5)
 
-        # Cycle time (given)
-        cycle_time = self.rng.uniform(cfg.cycle_time_min, cfg.cycle_time_max)
+        # Determine if downtime occurs (probability defined by downtime_prob)
+        current_time = time.time()
+        availability = 1.0  # Default to available
+
+        # Check if there's a disruption
+        if self.rng.random() < downtime_prob:
+            # Disruption: Set availability to 0 for a random time between 1 and 3 minutes
+            downtime_duration = random.randint(60, 180)  # Downtime duration in seconds
+            downtime_start_time = current_time
+            if current_time - self.last_downtime_end > downtime_duration:  # Only if downtime is finished
+                availability = 0.0
+                self.last_downtime_end = current_time  # Update downtime end time
+            else:
+                # If downtime still ongoing, ensure it continues
+                if current_time - downtime_start_time < downtime_duration:
+                    availability = 0.0
+                else:
+                    availability = 1.0  # Normal operation after downtime ends
+
+        # Other variables generation follows
+        cycle_time = self._randn(4.0, 0.1)  # Cycle time, Gaussian distribution with mean 4.0 and stddev 0.1
+        cycle_time = self._clamp(cycle_time, cfg.cycle_time_min, cfg.cycle_time_max)
 
         overhead = self.rng.uniform(cfg.overhead_min, cfg.overhead_max)
         injection_time = self.rng.uniform(cfg.injection_time_min, cfg.injection_time_max)
@@ -89,7 +111,11 @@ class IMMProxySimulator:
 
         if cooling_time < 1.5:
             delta = (1.5 - cooling_time)
-            injection_time = self._clamp(injection_time - 0.6 * delta, cfg.injection_time_min, cfg.injection_time_max)
+            injection_time = self._clamp(
+                injection_time - 0.6 * delta,
+                cfg.injection_time_min,
+                cfg.injection_time_max,
+            )
             cooling_time = cycle_time - overhead - injection_time + self._randn(0.0, 0.03)
         cooling_time = self._clamp(cooling_time, 1.5, 3.2)
 
@@ -102,40 +128,32 @@ class IMMProxySimulator:
             cfg.max_inj_pressure_max,
         )
 
-        # Rare anomalies
-        anomaly = (self.rng.random() < anomaly_prob)
-        anomaly_factor_temp = self.rng.choice([0.7, 1.3]) if anomaly else 1.0
-        anomaly_factor_press = self.rng.choice([0.85, 1.15]) if anomaly else 1.0
+        # OEE for THIS line (no suffix; folder identifies line)
+        # availability = self._trunc_norm_01(cfg.oee_availability_mean, cfg.oee_availability_sd)
+        productivity = self._trunc_norm_01(cfg.oee_productivity_mean, cfg.oee_productivity_sd)
+        quality = self._trunc_norm_01(cfg.oee_quality_mean, cfg.oee_quality_sd)
 
         row: Dict[str, float] = {
             "cycle_time": round(cycle_time, 4),
             "injection_time": round(injection_time, 4),
             "max_injection_pressure": round(max_injection_pressure, 2),
             "cooling_time": round(cooling_time, 4),
+            "oee_availability": round(availability, 4),
+            "oee_productivity": round(productivity, 4),
+            "oee_quality": round(quality, 4),
         }
-        
-        # ----- OEE stats per line (TOK, TOF, TOE) -----
-        for line in cfg.oee_lines:
-            availability = self._trunc_norm_01(cfg.oee_availability_mean, cfg.oee_availability_sd)
-            productivity = self._trunc_norm_01(cfg.oee_productivity_mean, cfg.oee_productivity_sd)
-            quality      = self._trunc_norm_01(cfg.oee_quality_mean, cfg.oee_quality_sd)
 
-            # Rounded but still "smooth"
-            row[f"oee_availability_{line}"] = round(availability, 4)
-            row[f"oee_productivity_{line}"] = round(productivity, 4)
-            row[f"oee_quality_{line}"]      = round(quality, 4)
-
+        # Continue generating the data for the cavities (like cavity_temp and cavity_pressure)
         cav_center = 220.0 + self._clamp(self.global_temp_drift, -0.25, 0.25)
-
         for i in range(cfg.n_cavities):
-            cav_temp = cav_center + self.cav_temp_offset[i] + self._randn(0.0, 0.05) * anomaly_factor_temp
+            cav_temp = self._randn(220.0, 0.5) + self.cav_temp_offset[i] + self._randn(0.0, 0.05)
             cav_temp = self._clamp(cav_temp, cfg.cavity_temp_min, cfg.cavity_temp_max)
 
-            hr_temp = cav_temp + 0.05 + self.hr_temp_offset[i] + self._randn(0.0, 0.04) * anomaly_factor_temp
+            hr_temp = self._randn(220.0, 0.5) + 0.05 + self.hr_temp_offset[i] + self._randn(0.0, 0.04)
             hr_temp = self._clamp(hr_temp, cfg.hotrunner_temp_min, cfg.hotrunner_temp_max)
 
             frac = self._clamp(self._randn(cfg.cavity_pressure_fraction_mean, cfg.cavity_pressure_fraction_sd), 0.45, 0.85)
-            cav_press = (max_injection_pressure * frac * self.cav_press_scale[i] + self._randn(0.0, 18.0)) * anomaly_factor_press
+            cav_press = (max_injection_pressure * frac * self.cav_press_scale[i] + self._randn(0.0, 18.0))
             cav_press = max(0.0, cav_press)
 
             row[f"cavity_temperature_{i+1:02d}"] = round(cav_temp, 3)
@@ -148,7 +166,6 @@ class IMMProxySimulator:
 # ---------------- Writer: one file per variable ----------------
 
 def safe_filename(var_name: str) -> str:
-    # keep alnum, dash, underscore, dot; replace others with underscore
     out = []
     for ch in var_name:
         if ch.isalnum() or ch in ("-", "_", "."):
@@ -165,42 +182,68 @@ def append_row(path: str, timestamp: str, value) -> None:
         f.write(f"{timestamp},{value}\n")
 
 
-def run_for_one_minute(
-    data_dir: str = "data",
+def run_simulation(
+    data_dir: str,
+    lines: List[str],
     seed: int = 7,
-    anomaly_prob: float = 0.01,
+    anomaly_prob: float = 0.02,
+    downtime_prob: float = 0.1,  # Downtime probability argument
+    duration_s: float = 180.0,
     use_utc: bool = True,
 ) -> None:
-    os.makedirs(data_dir, exist_ok=True)
+    sims: Dict[str, IMMProxySimulator] = {}
+    for idx, line in enumerate(lines):
+        line_seed = seed + 1000 * idx
+        sims[line] = IMMProxySimulator(SimConfig(seed=line_seed))
 
-    sim = IMMProxySimulator(SimConfig(seed=seed))
+        # Ensure per-line folder exists
+        os.makedirs(os.path.join(data_dir, line), exist_ok=True)
 
-    end_time = time.time() + 180.0
+    end_time = time.time() + duration_s
 
     while time.time() < end_time:
-        # Generate one cycle worth of data
-        row = sim.next_cycle(anomaly_prob=anomaly_prob)
+        for line, sim in sims.items():
+            row = sim.next_cycle(anomaly_prob=anomaly_prob, downtime_prob=downtime_prob)  # Pass downtime_prob
 
-        # Timestamp at generation time (ISO8601 with milliseconds)
-        now = datetime.now(timezone.utc) if use_utc else datetime.now().astimezone()
-        ts = now.isoformat(timespec="milliseconds")
+            now = datetime.now(timezone.utc) if use_utc else datetime.now().astimezone()
+            ts = now.isoformat(timespec="milliseconds")
 
-        # Append each variable into its own file
-        for var, val in row.items():
-            filename = safe_filename(var) + ".csv"
-            path = os.path.join(data_dir, filename)
-            append_row(path, ts, val)
+            line_dir = os.path.join(data_dir, line)
 
-        # Sleep approximately the cycle time (so the cadence matches your simulated cycle)
-        # If you want fixed-rate sampling instead, replace with time.sleep(0.1) or similar.
-        time.sleep(float(row["cycle_time"]))
+            for var, val in row.items():
+                filename = safe_filename(var) + ".csv"
+                path = os.path.join(line_dir, filename)
+                append_row(path, ts, val)
+
+        time.sleep(0.2)
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--data-dir", default="data")
+    p.add_argument("--lines", nargs="*", default=[], help="e.g. --lines TOK TOF TOE")
+    p.add_argument("--seed", type=int, default=7)
+    p.add_argument("--anomaly-prob", type=float, default=0.02)
+    p.add_argument("--downtime-prob", type=float, default=0.02, help="Probability of downtime (0.0 to 1.0)")
+    p.add_argument("--duration-s", type=float, default=180.0)
+    p.add_argument("--use-utc", action="store_true", default=True)
+    return p.parse_args()
 
 
 if __name__ == "__main__":
-    run_for_one_minute(
-        data_dir="data",
-        seed=7,
-        anomaly_prob=0.02,
-        use_utc=True,
-    )
-    print("Done. Files written to ./data/")
+    args = parse_args()
+
+    # If lines is empty -> generate nothing (matches your “no lines => no sections” intent)
+    if not args.lines:
+        print("No lines provided. Nothing to generate. Use: --lines TOK TOF ...")
+    else:
+        run_simulation(
+            data_dir=args.data_dir,
+            lines=args.lines,
+            seed=args.seed,
+            anomaly_prob=args.anomaly_prob,
+            downtime_prob=args.downtime_prob,
+            duration_s=args.duration_s,
+            use_utc=args.use_utc,
+        )
+        print(f"Done. Files written to ./{args.data_dir}/<LINE>/")
