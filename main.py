@@ -19,14 +19,25 @@ RULES_FILE = REPORTS_DIR / "rules.json"
 # ---- Configure your dataset names/patterns here ----
 def _list_lines() -> List[str]:
     _ensure_data_dir()
-    return sorted([p.name for p in DATA_DIR.iterdir() if p.is_dir() and not p.name.startswith(".")])
+    excluded_dirs = {"reports", "__pycache__"}
+
+    return sorted([
+        p.name.upper()
+        for p in DATA_DIR.iterdir()
+        if p.is_dir()
+        and not p.name.startswith(".")
+        and p.name.lower() not in excluded_dirs
+    ])
 
 def _validate_line(line: str) -> str:
-    line = (line or "").upper()
+    line = (line or "").strip().upper()
     if not line:
         raise HTTPException(status_code=400, detail="line is required")
-    if line not in _list_lines():
+
+    available_lines = _list_lines()
+    if line not in available_lines:
         raise HTTPException(status_code=404, detail=f"Unknown line: {line}")
+
     return line
 
 # Single-file signals (exact filenames)
